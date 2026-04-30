@@ -1,0 +1,20 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist",
+    "rootDir": "src",
+    "declaration": true,
+    "sourceMap": false,
+    "declarationMap": false,
+    // Override the inherited "bun-types" so source files cannot rely on
+    // ambient Bun globals (Bun.*, etc.) and silently leak Bun-only types
+    // into emitted dist/*.d.ts. We use @types/node instead — the plugin
+    // runs in OpenCode's runtime which provides Node's stdlib (node:fs,
+    // node:path, etc.) but not necessarily Bun globals. Tests can still
+    // use bun-types because they're excluded from the build below.
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["test/**/*"]
+}

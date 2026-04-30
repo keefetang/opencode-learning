@@ -177,10 +177,16 @@ describe("integration — full hook pipeline", () => {
     // Session end summary correct
     expect(events[4].tool_count).toBe(1);
     expect(events[4].files_modified).toBe(false); // read doesn't modify
-    expect(events[4].duration_ms).toBeGreaterThanOrEqual(0);
+    // Total session duration must reflect the sleep (>0), not be a hardcoded 0.
+    expect(events[4].duration_ms).toBeGreaterThan(0);
 
-    // Agent attribution carried through
-    expect(events[0].agent).toBe("operate");
+    // Compaction observation must carry the session ID — guards against a
+    // typo (sessionId vs sessionID) in the event handler that the loose
+    // `as never` cast on the test payload otherwise wouldn't surface.
+    expect(events[3].session).toBe(sessionID);
+
+    // Agent attribution flows: tool_call_start/end inherit from the chat.message
+    // session.agent. (events[0] trivially has the agent from the input.)
     expect(events[1].agent).toBe("operate");
     expect(events[2].agent).toBe("operate");
   });
@@ -292,9 +298,22 @@ describe("integration — full hook pipeline", () => {
     }
     expect(didThrow).toBe(false);
 
-    // The errors should have been logged via client.app.log
+    // The errors must be logged once per handler — exactly four. A loose
+    // `> 0` would silently miss a regression where one of the four handlers
+    // dropped its safeExecute wrapper. The "must not throw" invariant is
+    // the single most critical safety property in this plugin (see
+    // src/index.ts header).
     const errors = logCalls.filter((c) => c.level === "error");
-    expect(errors.length).toBeGreaterThan(0);
+    expect(errors.length).toBe(4);
+
+    // Each hook's name must appear in a logged message — locks in the
+    // diagnostic value of safeExecute's `name` parameter so reviewers can
+    // tell which handler failed from the logs alone.
+    const errorMessages = errors.map((e) => e.message);
+    expect(errorMessages.some((m) => m.includes("[chat.message]"))).toBe(true);
+    expect(errorMessages.some((m) => m.includes("[tool.execute.before]"))).toBe(true);
+    expect(errorMessages.some((m) => m.includes("[tool.execute.after]"))).toBe(true);
+    expect(errorMessages.some((m) => m.includes("[event]"))).toBe(true);
   });
 
   test("session.idle without a tracked session does not write session_end", async () => {
