@@ -1,9 +1,9 @@
 /**
- * storage.ts — Initialize and manage the .opencode-learning/ directory.
+ * storage.ts — Initialize and manage the .opencode/learning/ directory.
  *
  * On plugin init:
- * 1. Ensure `.opencode-learning/` exists in the working directory
- * 2. Create `.gitignore` inside it (exclude all by default)
+ * 1. Ensure `.opencode/` exists with a `.gitignore` (exclude all by default)
+ * 2. Ensure `.opencode/learning/` exists
  * 3. Create or load `meta.json` with project metadata
  */
 
@@ -12,13 +12,14 @@ import * as path from "node:path";
 
 import type { ProjectIdentity } from "./project-id.js";
 
-/** The storage directory name, created inside the repo root. */
-export const STORAGE_DIR = ".opencode-learning";
+/** Parent directory for all opencode project-local output. */
+const OPENCODE_DIR = ".opencode";
 
-/** Contents of the .gitignore inside .opencode-learning/ */
-const GITIGNORE_CONTENT = `# Exclude learning data from git by default.
-# Proposals can be opted-in when reviewed.
-*
+/** The storage subdirectory within .opencode/, created inside the repo root. */
+export const STORAGE_DIR = ".opencode/learning";
+
+/** Contents of the .gitignore inside .opencode/ — covers all subdirectories. */
+const GITIGNORE_CONTENT = `*
 !.gitignore
 `;
 
@@ -51,17 +52,23 @@ export function initStorage(
   directory: string,
   project: ProjectIdentity,
 ): ProjectMeta {
+  const opencodeDir = path.join(directory, OPENCODE_DIR);
   const storageDir = path.join(directory, STORAGE_DIR);
 
-  // Create directory if needed
-  if (!fs.existsSync(storageDir)) {
-    fs.mkdirSync(storageDir, { recursive: true });
+  // Create .opencode/ parent if needed
+  if (!fs.existsSync(opencodeDir)) {
+    fs.mkdirSync(opencodeDir, { recursive: true });
   }
 
-  // Ensure .gitignore exists
-  const gitignorePath = path.join(storageDir, ".gitignore");
+  // Ensure .opencode/.gitignore exists (covers all subdirectories)
+  const gitignorePath = path.join(opencodeDir, ".gitignore");
   if (!fs.existsSync(gitignorePath)) {
     fs.writeFileSync(gitignorePath, GITIGNORE_CONTENT, "utf-8");
+  }
+
+  // Create learning/ subdirectory if needed
+  if (!fs.existsSync(storageDir)) {
+    fs.mkdirSync(storageDir, { recursive: true });
   }
 
   // Load or create meta.json
@@ -141,7 +148,7 @@ function createMeta(
  * Get the absolute path to a file inside the storage directory.
  *
  * @param directory - The repo root / working directory
- * @param filename - File name within .opencode-learning/
+ * @param filename - File name within .opencode/learning/
  * @returns Absolute path to the file
  */
 export function storagePath(directory: string, filename: string): string {

@@ -2,7 +2,7 @@
  * opencode-learning — Plugin entry point.
  *
  * Observes session events (chat messages, tool calls, session lifecycle)
- * and writes append-only JSONL to .opencode-learning/observations.jsonl
+ * and writes append-only JSONL to .opencode/learning/observations.jsonl
  * for later pattern extraction.
  *
  * CRITICAL SAFETY INVARIANT: Every hook handler is wrapped in safeExecute.
@@ -45,7 +45,7 @@ const LearningPlugin: Plugin = async (ctx) => {
   // Detect project identity
   const project = detectProject(directory);
 
-  // Initialize storage (.opencode-learning/ dir, meta.json, .gitignore).
+  // Initialize storage (.opencode/learning/ dir, meta.json, .gitignore).
   // Side effect only — meta.json is consumed by the extraction process,
   // not by the plugin at runtime.
   initStorage(directory, project);

@@ -9,7 +9,7 @@
  *   event(idle)        → session_end observation (with summary fields)
  *
  * Verifies cross-hook behaviour the unit tests can't:
- *  - Storage init creates .opencode-learning/ + meta.json + .gitignore
+ *  - Storage init creates .opencode/learning/ + meta.json + .gitignore
  *  - Self-event filter (every observation has source: "learning")
  *  - call_id pairing across before/after
  *  - duration_ms is computed (>= 0)
@@ -67,7 +67,7 @@ let logCalls: Array<{ level: string; message: string }>;
 
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "oclearn-int-"));
-  observationsPath = path.join(tmpDir, ".opencode-learning", "observations.jsonl");
+  observationsPath = path.join(tmpDir, ".opencode", "learning", "observations.jsonl");
   const { ctx, logCalls: calls } = makeMockContext(tmpDir);
   logCalls = calls;
   plugin = await LearningPlugin(ctx);
@@ -82,18 +82,18 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("integration — storage init", () => {
-  test("creates .opencode-learning/ directory", () => {
-    expect(fs.existsSync(path.join(tmpDir, ".opencode-learning"))).toBe(true);
+  test("creates .opencode/learning/ directory", () => {
+    expect(fs.existsSync(path.join(tmpDir, ".opencode", "learning"))).toBe(true);
   });
 
   test("creates .gitignore inside storage dir", () => {
-    const gi = path.join(tmpDir, ".opencode-learning", ".gitignore");
+    const gi = path.join(tmpDir, ".opencode", ".gitignore");
     expect(fs.existsSync(gi)).toBe(true);
     expect(fs.readFileSync(gi, "utf-8")).toContain("*");
   });
 
   test("creates meta.json with expected shape", () => {
-    const metaPath = path.join(tmpDir, ".opencode-learning", "meta.json");
+    const metaPath = path.join(tmpDir, ".opencode", "learning", "meta.json");
     expect(fs.existsSync(metaPath)).toBe(true);
     const meta = JSON.parse(fs.readFileSync(metaPath, "utf-8"));
     expect(meta.version).toBeDefined();

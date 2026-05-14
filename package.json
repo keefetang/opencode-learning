@@ -1,6 +1,6 @@
 {
   "name": "opencode-learning",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "OpenCode plugin that observes session events and captures patterns for continuous learning",
   "type": "module",
   "main": "dist/index.js",

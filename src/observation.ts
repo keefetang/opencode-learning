@@ -1,7 +1,7 @@
 /**
  * observation.ts — Observation event types and JSONL writer.
  *
- * The on-disk schema for `.opencode-learning/observations.jsonl`. Every line
+ * The on-disk schema for `.opencode/learning/observations.jsonl`. Every line
  * is a single JSON object conforming to the discriminated `Observation` union.
  *
  * Schema discipline: this format is consumed by a separate extraction process
