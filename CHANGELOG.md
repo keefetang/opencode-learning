@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.1] — 2026-05-16
+
+### Added
+- AGENTS.md
+
+### Changed
+- Updated devDeps: bun-types ^1.3.14, typescript ^6.0.3, removed @types/node
+- Standardized .gitignore, switched lockfile from package-lock.json to bun.lock
+
 ## [0.3.0]
 
 ### Changed

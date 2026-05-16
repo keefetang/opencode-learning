@@ -1,8 +1,10 @@
 node_modules/
+.opencode/
 dist/
 *.tgz
+.DS_Store
+package-lock.json
 STATE.md
 TODO.md
 RELEASING.md
 MIGRATION.md
-
