@@ -9,13 +9,14 @@
  *   event(idle)        → session_end observation (with summary fields)
  *
  * Verifies cross-hook behaviour the unit tests can't:
- *  - Storage init creates .opencode/learning/ + meta.json + .gitignore
+ *  - Storage init creates .opencode/learning/ + .gitignore
  *  - Self-event filter (every observation has source: "learning")
  *  - call_id pairing across before/after
  *  - duration_ms is computed (>= 0)
  *  - tool_count / files_modified accumulate into session_end
  *  - agent attribution flows from chat.message → tool hooks
- *  - Write tool args have content stripped via redaction
+ *  - Write tool args have content stripped via sanitization
+ *  - Bash tool args have command truncated via sanitization
  *  - safeExecute swallows malformed input without throwing
  */
 
@@ -25,6 +26,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import LearningPlugin from "../src/index.js";
+import { storagePath } from "../src/storage.js";
 
 // ---------------------------------------------------------------------------
 // Mock PluginInput
@@ -86,29 +88,77 @@ describe("integration — storage init", () => {
     expect(fs.existsSync(path.join(tmpDir, ".opencode", "learning"))).toBe(true);
   });
 
-  test("creates .gitignore inside storage dir", () => {
+  test("creates .gitignore inside .opencode/", () => {
     const gi = path.join(tmpDir, ".opencode", ".gitignore");
     expect(fs.existsSync(gi)).toBe(true);
     expect(fs.readFileSync(gi, "utf-8")).toContain("*");
   });
 
-  test("creates meta.json with expected shape", () => {
+  test("does not create meta.json (removed)", () => {
     const metaPath = path.join(tmpDir, ".opencode", "learning", "meta.json");
-    expect(fs.existsSync(metaPath)).toBe(true);
-    const meta = JSON.parse(fs.readFileSync(metaPath, "utf-8"));
-    expect(meta.version).toBeDefined();
-    expect(typeof meta.projectId).toBe("string");
-    expect(meta.projectId.length).toBeGreaterThan(0);
-    expect(typeof meta.projectName).toBe("string");
-    expect(meta.projectRoot).toBe(tmpDir);
-    expect(meta.lastExtractionAt).toBeNull();
-    expect(typeof meta.createdAt).toBe("string");
+    expect(fs.existsSync(metaPath)).toBe(false);
   });
 
   test("logs a load message", () => {
     const loaded = logCalls.find((c) => c.message.includes("opencode-learning loaded"));
     expect(loaded).toBeDefined();
     expect(loaded!.level).toBe("info");
+  });
+});
+
+describe("integration — storagePath path traversal protection", () => {
+  test("storagePath strips directory components from filename", () => {
+    const result = storagePath("/home/user/project", "../../etc/passwd");
+    // Should resolve to /home/user/project/.opencode/learning/passwd
+    expect(result).not.toContain("../../");
+    expect(result.endsWith("passwd")).toBe(true);
+    expect(result).toContain(".opencode/learning/");
+  });
+
+  test("storagePath handles normal filenames unchanged", () => {
+    const result = storagePath("/home/user/project", "observations.jsonl");
+    expect(result).toBe(path.join("/home/user/project", ".opencode/learning", "observations.jsonl"));
+  });
+
+  test("storagePath strips subdirectory from filename", () => {
+    const result = storagePath("/project", "subdir/file.txt");
+    expect(result).not.toContain("subdir/");
+    expect(result.endsWith("file.txt")).toBe(true);
+  });
+});
+
+describe("integration — init failure resilience", () => {
+  test("plugin loads even when directory is non-writable (hooks still register)", async () => {
+    // Use a path that will cause initStorage to fail (non-existent deep path
+    // where mkdir would fail because we can't write to /nonexistent)
+    const { ctx, logCalls: calls } = makeMockContext("/nonexistent/path/that/fails");
+    const hooks = await LearningPlugin(ctx);
+
+    // Hooks must still be registered
+    expect(hooks["chat.message"]).toBeDefined();
+    expect(hooks["tool.execute.before"]).toBeDefined();
+    expect(hooks["tool.execute.after"]).toBeDefined();
+    expect(hooks.event).toBeDefined();
+
+    // Should have logged the init failure
+    const errorLog = calls.find((c) => c.message.includes("init failed"));
+    expect(errorLog).toBeDefined();
+    expect(errorLog!.level).toBe("error");
+
+    // Hooks should run without throwing (silently no-op on write)
+    let didThrow = false;
+    try {
+      await hooks["chat.message"]!(
+        { sessionID: "s1", agent: "test" },
+        {
+          message: { agent: "test", id: "m1", role: "user" } as never,
+          parts: [{ type: "text", text: "hi" }] as never,
+        },
+      );
+    } catch {
+      didThrow = true;
+    }
+    expect(didThrow).toBe(false);
   });
 });
 
@@ -242,6 +292,33 @@ describe("integration — full hook pipeline", () => {
     expect(sessionEnd.tool_count).toBe(1);
   });
 
+  test("bash tool truncates command in args (not dropped)", async () => {
+    const sessionID = "test-session-bash";
+    const callID = "test-call-bash";
+
+    await plugin["tool.execute.before"]!(
+      { tool: "bash", sessionID, callID },
+      { args: { command: "bun test", description: "run tests", timeout: 5000 } },
+    );
+
+    await plugin["tool.execute.after"]!(
+      { tool: "bash", sessionID, callID, args: { command: "bun test" } },
+      { title: "bash", output: "ok", metadata: {} },
+    );
+
+    const lines = fs.readFileSync(observationsPath, "utf-8").trim().split("\n");
+    const events = lines.map((l) => JSON.parse(l));
+
+    const startEvent = events[0];
+    expect(startEvent.tool).toBe("bash");
+    // Short commands pass through unchanged
+    expect(startEvent.args.command).toBe("bun test");
+    expect(startEvent.args.description).toBe("run tests");
+    expect(startEvent.args.timeout).toBe(5000);
+    // No content was dropped — command was just truncated (short enough to pass through)
+    expect(startEvent.args._content_dropped).toBeUndefined();
+  });
+
   test("tool errors are detected via metadata.isError", async () => {
     const sessionID = "test-session-err";
     const callID = "test-call-err";
@@ -316,6 +393,29 @@ describe("integration — full hook pipeline", () => {
     expect(errorMessages.some((m) => m.includes("[event]"))).toBe(true);
   });
 
+  test("session_end includes observations_dropped field", async () => {
+    const sessionID = "test-session-dropped";
+
+    await plugin["chat.message"]!(
+      { sessionID, agent: "operate" },
+      {
+        message: { agent: "operate", id: "m1", role: "user" } as never,
+        parts: [{ type: "text", text: "hello" }] as never,
+      },
+    );
+
+    await plugin.event!({
+      event: { type: "session.idle", properties: { sessionID } } as never,
+    });
+
+    const lines = fs.readFileSync(observationsPath, "utf-8").trim().split("\n");
+    const events = lines.map((l) => JSON.parse(l));
+    const sessionEnd = events.find((e: { type: string }) => e.type === "session_end");
+    expect(sessionEnd).toBeDefined();
+    expect(typeof sessionEnd.observations_dropped).toBe("number");
+    expect(sessionEnd.observations_dropped).toBe(0);
+  });
+
   test("session.idle without a tracked session does not write session_end", async () => {
     // No prior chat.message → no session created. Idle event should be a no-op.
     await plugin.event!({
@@ -323,5 +423,75 @@ describe("integration — full hook pipeline", () => {
     });
 
     expect(fs.existsSync(observationsPath)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// looksLikeError — tested through tool.execute.after hook's success field
+// ---------------------------------------------------------------------------
+
+describe("integration — looksLikeError via tool.execute.after success field", () => {
+  /**
+   * Helper: fire tool.execute.before + after with given metadata, return
+   * the `success` field from the tool_call_end observation.
+   */
+  async function getSuccessForMetadata(metadata: unknown): Promise<boolean> {
+    const sessionID = `err-test-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const callID = `call-${sessionID}`;
+
+    await plugin["tool.execute.before"]!(
+      { tool: "bash", sessionID, callID },
+      { args: { command: "test" } },
+    );
+    await plugin["tool.execute.after"]!(
+      { tool: "bash", sessionID, callID, args: { command: "test" } },
+      { title: "bash", output: "ok", metadata },
+    );
+
+    const lines = fs.readFileSync(observationsPath, "utf-8").trim().split("\n");
+    const events = lines.map((l) => JSON.parse(l));
+    const endEvent = events.filter((e: { type: string }) => e.type === "tool_call_end").pop();
+    expect(endEvent).toBeDefined();
+    return endEvent.success as boolean;
+  }
+
+  test("metadata: { error: 'some error' } → detected as error", async () => {
+    expect(await getSuccessForMetadata({ error: "some error" })).toBe(false);
+  });
+
+  test("metadata: { error: true } → detected as error", async () => {
+    expect(await getSuccessForMetadata({ error: true })).toBe(false);
+  });
+
+  test("metadata: { error: false } → NOT detected as error", async () => {
+    expect(await getSuccessForMetadata({ error: false })).toBe(true);
+  });
+
+  test("metadata: { error: null } → NOT detected as error", async () => {
+    expect(await getSuccessForMetadata({ error: null })).toBe(true);
+  });
+
+  test("metadata: { isError: true } → detected as error", async () => {
+    expect(await getSuccessForMetadata({ isError: true })).toBe(false);
+  });
+
+  test("metadata: { isError: false } → NOT detected as error", async () => {
+    expect(await getSuccessForMetadata({ isError: false })).toBe(true);
+  });
+
+  test("metadata: 'error occurred' (string) → detected as error", async () => {
+    expect(await getSuccessForMetadata("error occurred")).toBe(false);
+  });
+
+  test("metadata: {} → NOT detected as error", async () => {
+    expect(await getSuccessForMetadata({})).toBe(true);
+  });
+
+  test("metadata: null → NOT detected as error", async () => {
+    expect(await getSuccessForMetadata(null)).toBe(true);
+  });
+
+  test("metadata: undefined → NOT detected as error", async () => {
+    expect(await getSuccessForMetadata(undefined)).toBe(true);
   });
 });

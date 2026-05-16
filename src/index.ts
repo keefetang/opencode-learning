@@ -7,14 +7,14 @@
  *
  * CRITICAL SAFETY INVARIANT: Every hook handler is wrapped in safeExecute.
  * A thrown error in most hooks kills the user's session (verified in
- * sst/opencode framework source — anchor.md A.5). The framework provides
- * NO safety net for most hook types.
+ * sst/opencode framework source). The framework provides NO safety net
+ * for most hook types.
  *
- * SELF-EVENT FILTERING (anchor.md A.6): Every observation written includes
- * `source: "learning"`. The `event` handler is structurally filtered to
- * only `session.idle` and `session.compacted` event types — all other
- * events (including ones potentially emitted by future versions of this
- * plugin) are ignored without inspection.
+ * SELF-EVENT FILTERING: Every observation written includes `source: "learning"`.
+ * The `event` handler is structurally filtered to only `session.idle` and
+ * `session.compacted` event types — all other events (including ones
+ * potentially emitted by future versions of this plugin) are ignored
+ * without inspection.
  */
 
 import type { Hooks, Plugin } from "@opencode-ai/plugin";
@@ -26,11 +26,11 @@ import {
   type ToolCallEndObservation,
   type ToolCallStartObservation,
   type UserMessageObservation,
+  getAndResetDroppedCount,
+  initBytesWritten,
   writeObservation,
 } from "./observation.js";
-import { detectProject } from "./project-id.js";
-import { redactString, redactToolArgs } from "./redaction.js";
-import { safeExecute } from "./safe-execute.js";
+import { sanitizeToolArgs, summarizeText } from "./sanitize.js";
 import { createSessionManager } from "./session-state.js";
 import { initStorage, storagePath } from "./storage.js";
 
@@ -42,29 +42,44 @@ const LearningPlugin: Plugin = async (ctx) => {
   const directory = ctx.directory;
   const client = ctx.client;
 
-  // Detect project identity
-  const project = detectProject(directory);
+  // Initialize storage and resolve observation path. Wrapped in try/catch
+  // so a failure (read-only filesystem, broken symlinks, disk full) does
+  // not prevent hook registration. On failure, hooks still run but
+  // observations are silently dropped (observationsPath is null).
+  let observationsPath: string | null = null;
+  try {
+    // Initialize storage (.opencode/learning/ dir, .gitignore).
+    initStorage(directory);
 
-  // Initialize storage (.opencode/learning/ dir, meta.json, .gitignore).
-  // Side effect only — meta.json is consumed by the extraction process,
-  // not by the plugin at runtime.
-  initStorage(directory, project);
+    // Resolved path for the observation log. Computed once at plugin init
+    // so the per-hook path is a constant string.
+    observationsPath = storagePath(directory, "observations.jsonl");
 
-  // Resolved path for the observation log. Computed once at plugin init
-  // so the per-hook path is a constant string.
-  const observationsPath = storagePath(directory, "observations.jsonl");
+    // Seed the byte counter from any existing file so rotation tracking
+    // resumes across plugin restarts.
+    initBytesWritten(observationsPath);
+
+    // Diagnostic log — confirms plugin loaded (visible in --print-logs)
+    void client.app.log({
+      body: {
+        service: "opencode-learning",
+        level: "info",
+        message: "opencode-learning loaded",
+      },
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    void client.app.log({
+      body: {
+        service: "opencode-learning",
+        level: "error",
+        message: `opencode-learning init failed (observations disabled): ${message}`,
+      },
+    });
+  }
 
   // Session state manager (in-memory, not persisted)
   const sessionManager = createSessionManager();
-
-  // Diagnostic log — confirms plugin loaded (visible in --print-logs)
-  void client.app.log({
-    body: {
-      service: "opencode-learning",
-      level: "info",
-      message: `opencode-learning loaded (project: ${project.projectName}, id: ${project.projectId})`,
-    },
-  });
 
   // -----------------------------------------------------------------------
   // Hooks — all wrapped in safeExecute
@@ -94,7 +109,7 @@ const LearningPlugin: Plugin = async (ctx) => {
           source: "learning",
           agent,
           parent: null, // v1 limitation — see observation.ts
-          text: redactString(text),
+          text: summarizeText(text),
         };
         writeObservation(observationsPath, obs);
       },
@@ -115,9 +130,9 @@ const LearningPlugin: Plugin = async (ctx) => {
         session.toolCallStartTimes.set(input.callID, startTime);
 
         // The args mutate live: `output.args` is what the framework will
-        // pass to the tool. We capture a redacted snapshot — args is
+        // pass to the tool. We capture a sanitized snapshot — args is
         // typed as `any`, but we treat it as `Record<string, unknown>`
-        // for redaction purposes.
+        // for sanitization purposes.
         const rawArgs = (output.args ?? {}) as Record<string, unknown>;
 
         const obs: ToolCallStartObservation = {
@@ -128,7 +143,7 @@ const LearningPlugin: Plugin = async (ctx) => {
           agent: session.agent,
           tool: input.tool,
           call_id: input.callID,
-          args: redactToolArgs(input.tool, rawArgs),
+          args: sanitizeToolArgs(input.tool, rawArgs),
         };
         writeObservation(observationsPath, obs);
       },
@@ -187,7 +202,7 @@ const LearningPlugin: Plugin = async (ctx) => {
       async () => {
         // Structural filter: only two event types are observed. All others
         // (including potential self-emissions from future tool registrations)
-        // are ignored without inspection. See anchor.md A.6.
+        // are ignored without inspection.
         if (input.event.type === "session.idle") {
           const sessionID = input.event.properties.sessionID;
           const session = sessionManager.get(sessionID);
@@ -201,6 +216,7 @@ const LearningPlugin: Plugin = async (ctx) => {
               duration_ms: endTime - session.startTime,
               tool_count: session.toolCallCount,
               files_modified: session.filesModified,
+              observations_dropped: getAndResetDroppedCount(),
             };
             writeObservation(observationsPath, obs);
             // Clear any unmatched in-flight tool starts (defensive — the
@@ -292,4 +308,36 @@ function looksLikeError(output: { title: string; output: string; metadata: unkno
     return true;
   }
   return false;
+}
+
+// ---------------------------------------------------------------------------
+// safeExecute — try/catch wrapper for hook handlers
+//
+// Every hook handler in this plugin MUST be wrapped in safeExecute.
+// A thrown error in most hooks kills the user's session entirely
+// (verified in sst/opencode framework source). The framework provides
+// NO safety net for most hook types.
+// ---------------------------------------------------------------------------
+
+type PluginClient = Parameters<Plugin>[0]["client"];
+
+async function safeExecute<T>(
+  name: string,
+  fn: () => Promise<T>,
+  client: PluginClient,
+  fallback?: T,
+): Promise<T | undefined> {
+  try {
+    return await fn();
+  } catch (err: unknown) {
+    const message = err instanceof Error ? (err.stack ?? err.message) : String(err);
+    void client.app.log({
+      body: {
+        service: "opencode-learning",
+        level: "error",
+        message: `[${name}] Error: ${message}`,
+      },
+    });
+    return fallback;
+  }
 }

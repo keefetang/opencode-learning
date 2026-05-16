@@ -1,15 +1,15 @@
 /**
  * Unit tests for observation construction + JSONL writing.
  *
- * Covers the contract of observation.ts and the redaction-integrated path
+ * Covers the contract of observation.ts and the sanitization-integrated path
  * that the hooks use:
  *  - Each of the 5 observation types serializes to a single JSON line
  *  - writeObservation appends, never overwrites
  *  - Every observation carries `source: "learning"` (self-event filter)
- *  - Redaction is applied to user_message text and tool_call_start args
+ *  - Sanitization is applied to user_message text and tool_call_start args
  *  - Hook-shaped construction stays well under the 5ms latency budget
  *
- * Test framework: bun:test (matches existing test/redaction.test.ts).
+ * Test framework: bun:test (matches existing test/sanitize.test.ts).
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -19,14 +19,17 @@ import * as path from "node:path";
 
 import {
   type CompactionObservation,
+  MAX_FILE_SIZE_BYTES,
   type Observation,
   type SessionEndObservation,
   type ToolCallEndObservation,
   type ToolCallStartObservation,
   type UserMessageObservation,
+  getAndResetDroppedCount,
+  initBytesWritten,
   writeObservation,
 } from "../src/observation.js";
-import { redactString, redactToolArgs } from "../src/redaction.js";
+import { sanitizeToolArgs, summarizeText } from "../src/sanitize.js";
 
 // ---------------------------------------------------------------------------
 // Temp file fixture
@@ -123,6 +126,7 @@ function makeSessionEnd(
     duration_ms: 300_000,
     tool_count: 12,
     files_modified: true,
+    observations_dropped: 0,
     ...overrides,
   };
 }
@@ -173,12 +177,13 @@ describe("Observation construction — all 5 variants", () => {
     expect(obs.duration_ms).toBeGreaterThanOrEqual(0);
   });
 
-  test("session_end carries duration, tool_count, files_modified", () => {
+  test("session_end carries duration, tool_count, files_modified, observations_dropped", () => {
     const obs = makeSessionEnd();
     expect(obs.type).toBe("session_end");
     expect(typeof obs.duration_ms).toBe("number");
     expect(typeof obs.tool_count).toBe("number");
     expect(typeof obs.files_modified).toBe("boolean");
+    expect(typeof obs.observations_dropped).toBe("number");
   });
 
   test("compaction has only the base fields", () => {
@@ -291,17 +296,13 @@ describe("writeObservation — JSONL serialization", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 4. Redaction integration — hook-path behavior
+// 4. Sanitization integration — hook-path behavior
 // ---------------------------------------------------------------------------
 
-describe("Redaction integration — secrets are scrubbed before write", () => {
-  test("user_message text redacts an Anthropic API key (prefix pattern)", () => {
-    // Constructed so the prefix detector fires. The redaction.test.ts
-    // suite covers detection breadth — we only need to confirm that the
-    // hook-path wiring (redactString → writeObservation) preserves it.
-    const secret = "sk-ant-api03-" + "A".repeat(95);
-    const text = `Here is my key: ${secret}`;
-    const obs = makeUserMessage({ text: redactString(text) });
+describe("Sanitization integration — data is sanitized before write", () => {
+  test("user_message text gets truncated (not pattern-redacted)", () => {
+    const longText = "This is a user message with some long content. ".repeat(10);
+    const obs = makeUserMessage({ text: summarizeText(longText) });
     writeObservation(tempFile, obs);
 
     const lines = readObservations(tempFile);
@@ -309,15 +310,14 @@ describe("Redaction integration — secrets are scrubbed before write", () => {
     const parsed = lines[0];
     expect(parsed?.type).toBe("user_message");
     if (parsed?.type === "user_message") {
-      expect(parsed.text).not.toContain(secret);
-      expect(parsed.text).toContain("<REDACTED:");
+      expect(parsed.text.length).toBeLessThan(longText.length);
+      expect(parsed.text).toContain("…<");
+      expect(parsed.text).toContain(" more>");
     }
   });
 
   test("tool_call_start drops content fields for edit tool", () => {
-    // Redaction's tool-specific pass drops `oldString`/`newString`/`content`
-    // from edit-tool args. Verify the hook-wiring path matches.
-    const args = redactToolArgs("edit", {
+    const args = sanitizeToolArgs("edit", {
       filePath: "/tmp/foo.txt",
       oldString: "secret value here",
       newString: "another secret",
@@ -336,10 +336,10 @@ describe("Redaction integration — secrets are scrubbed before write", () => {
     }
   });
 
-  test("env-var-keyed values get redacted recursively", () => {
-    const args = redactToolArgs("bash", {
-      command: "deploy.sh",
-      env: { DATABASE_PASSWORD: "hunter2hunter2", PATH: "/usr/bin" },
+  test("bash tool args have command truncated (not dropped)", () => {
+    const args = sanitizeToolArgs("bash", {
+      command: "bun test",
+      description: "run tests",
     });
     const obs = makeToolCallStart({ tool: "bash", args });
     writeObservation(tempFile, obs);
@@ -347,9 +347,10 @@ describe("Redaction integration — secrets are scrubbed before write", () => {
     const lines = readObservations(tempFile);
     const parsed = lines[0];
     if (parsed?.type === "tool_call_start") {
-      const env = parsed.args.env as Record<string, unknown>;
-      expect(env.DATABASE_PASSWORD).toBe("<REDACTED:env-var>");
-      expect(env.PATH).toBe("/usr/bin"); // PATH is not a sensitive name
+      // Short command passes through unchanged
+      expect(parsed.args.command).toBe("bun test");
+      expect(parsed.args.description).toBe("run tests");
+      expect(parsed.args._content_dropped).toBeUndefined();
     }
   });
 });
@@ -364,8 +365,7 @@ describe("Hook latency budget", () => {
     const samples: number[] = [];
 
     // Representative observation: the heaviest of the five types is
-    // tool_call_start with redaction applied. We construct a non-trivial
-    // args payload to stress the JSON serializer.
+    // tool_call_start with sanitization applied.
     const baseArgs = {
       command: 'echo "hello world" && grep -r "pattern" .',
       cwd: "/Users/test/project",
@@ -374,7 +374,7 @@ describe("Hook latency budget", () => {
 
     for (let i = 0; i < ITERATIONS; i++) {
       const start = performance.now();
-      const args = redactToolArgs("bash", baseArgs);
+      const args = sanitizeToolArgs("bash", baseArgs);
       const obs: ToolCallStartObservation = {
         ts: new Date().toISOString(),
         type: "tool_call_start",
@@ -395,14 +395,123 @@ describe("Hook latency budget", () => {
     const p99 = samples[Math.floor(ITERATIONS * 0.99)] ?? 0;
     const max = samples[samples.length - 1] ?? 0;
 
-    // Diagnostic for the test log — visible alongside the redaction perf.
+    // Diagnostic for the test log
     console.log(
       `[perf] observation hook: p50=${p50.toFixed(3)}ms p99=${p99.toFixed(3)}ms max=${max.toFixed(3)}ms over ${ITERATIONS} iterations`,
     );
 
     // Hook latency budget is 5ms. Allow generous margin in the test (3ms p99)
-    // because file I/O on slow CI disks can spike. If this fails, the budget
-    // is genuinely at risk.
+    // because file I/O on slow CI disks can spike.
     expect(p99).toBeLessThan(3);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 6. Dropped observation counter
+// ---------------------------------------------------------------------------
+
+describe("getAndResetDroppedCount — tracks write failures", () => {
+  test("initial count is zero", () => {
+    // Reset any accumulated state from prior tests
+    getAndResetDroppedCount();
+    expect(getAndResetDroppedCount()).toBe(0);
+  });
+
+  test("increments on write failure and resets on read", () => {
+    // Reset baseline
+    getAndResetDroppedCount();
+
+    // Write to a non-existent directory to trigger the catch path
+    const badPath = path.join(os.tmpdir(), `no-such-dir-${Date.now()}`, "obs.jsonl");
+    writeObservation(badPath, makeUserMessage());
+    writeObservation(badPath, makeUserMessage());
+    writeObservation(badPath, makeUserMessage());
+
+    expect(getAndResetDroppedCount()).toBe(3);
+    // Second call should return 0 (reset)
+    expect(getAndResetDroppedCount()).toBe(0);
+  });
+
+  test("successful writes do not increment counter", () => {
+    getAndResetDroppedCount();
+    writeObservation(tempFile, makeUserMessage());
+    writeObservation(tempFile, makeToolCallStart());
+    expect(getAndResetDroppedCount()).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7. writeObservation with null path — graceful no-op
+// ---------------------------------------------------------------------------
+
+describe("writeObservation — null path handling", () => {
+  test("null filePath is a no-op (does not throw or write)", () => {
+    getAndResetDroppedCount();
+    expect(() => writeObservation(null, makeUserMessage())).not.toThrow();
+    // null path should not count as a dropped observation
+    expect(getAndResetDroppedCount()).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8. File rotation — byte-counter based
+// ---------------------------------------------------------------------------
+
+describe("writeObservation — file rotation", () => {
+  test("file exceeding MAX_FILE_SIZE_BYTES is rotated to .1.jsonl", () => {
+    // Create a file just over the limit
+    const bigContent = "x".repeat(MAX_FILE_SIZE_BYTES + 1);
+    fs.writeFileSync(tempFile, bigContent, "utf-8");
+
+    // Seed the byte counter from the existing file
+    initBytesWritten(tempFile);
+
+    // Write an observation — should trigger rotation first
+    writeObservation(tempFile, makeUserMessage());
+
+    // The original file should now contain only the new observation
+    const newContent = fs.readFileSync(tempFile, "utf-8");
+    const lines = newContent.trim().split("\n");
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0]!).type).toBe("user_message");
+
+    // The backup should exist with the old content
+    const { dir, name, ext } = path.parse(tempFile);
+    const backupPath = path.join(dir, `${name}.1${ext}`);
+    expect(fs.existsSync(backupPath)).toBe(true);
+    const backupContent = fs.readFileSync(backupPath, "utf-8");
+    expect(backupContent.length).toBe(MAX_FILE_SIZE_BYTES + 1);
+
+    // Clean up backup
+    try { fs.unlinkSync(backupPath); } catch { /* ignore */ }
+  });
+
+  test("file under MAX_FILE_SIZE_BYTES is NOT rotated", () => {
+    // Write a small amount of data
+    fs.writeFileSync(tempFile, "existing line\n", "utf-8");
+
+    // Seed the byte counter
+    initBytesWritten(tempFile);
+
+    writeObservation(tempFile, makeUserMessage());
+
+    // File should have both the original line and the observation
+    const content = fs.readFileSync(tempFile, "utf-8");
+    expect(content).toContain("existing line");
+    expect(content).toContain("user_message");
+
+    // No backup should exist
+    const { dir: d, name: n, ext: e } = path.parse(tempFile);
+    const backupPath = path.join(d, `${n}.1${e}`);
+    expect(fs.existsSync(backupPath)).toBe(false);
+  });
+
+  test("MAX_FILE_SIZE_BYTES constant is 10MB", () => {
+    expect(MAX_FILE_SIZE_BYTES).toBe(10 * 1024 * 1024);
+  });
+
+  test("initBytesWritten handles non-existent file gracefully", () => {
+    // Should not throw — sets bytesWritten to 0 internally
+    expect(() => initBytesWritten("/nonexistent/path.jsonl")).not.toThrow();
   });
 });

@@ -8,14 +8,14 @@
  * that reads accumulated observations and clusters patterns. Changes to the
  * schema invalidate prior data — bump a version field or migrate carefully.
  *
- * Self-event filtering (anchor.md A.6): every observation includes
- * `source: "learning"` so future versions of this plugin (or downstream
- * consumers) can identify and exclude self-emitted events.
+ * Self-event filtering: every observation includes `source: "learning"`
+ * so future versions of this plugin (or downstream consumers) can
+ * identify and exclude self-emitted events.
  *
  * v1 limitations:
  *   - `parent` is always null. Determining the parent session ID for a
  *     subagent requires `client.session.get(...)` which is an HTTP round-trip
- *     and would blow the 5ms hook budget (anchor.md A.4). The SDK's
+ *     and would blow the 5ms hook latency budget. The SDK's
  *     `chat.message` hook input does NOT expose parentID directly. Defer
  *     proper parent detection to a later phase.
  *   - `tool_call_end.success` is best-effort. The `tool.execute.after` hook
@@ -26,6 +26,7 @@
  */
 
 import * as fs from "node:fs";
+import * as path from "node:path";
 
 // ---------------------------------------------------------------------------
 // Common base
@@ -45,7 +46,7 @@ export interface ObservationBase {
   /**
    * Always the literal `"learning"`. Used by future plugin versions and
    * downstream consumers to filter out self-emitted events without inspecting
-   * tags or per-tool metadata. See anchor.md A.6.
+   * tags or per-tool metadata.
    */
   source: "learning";
 }
@@ -61,7 +62,7 @@ export interface UserMessageObservation extends ObservationBase {
   agent: string;
   /** Parent session ID for subagent sessions. v1 always writes null. */
   parent: string | null;
-  /** Redacted message text, concatenated from all TextPart entries. */
+  /** Truncated message text summary, concatenated from all TextPart entries. */
   text: string;
 }
 
@@ -74,7 +75,7 @@ export interface ToolCallStartObservation extends ObservationBase {
   tool: string;
   /** OpenCode `callID` — pairs the start and end observations. */
   call_id: string;
-  /** Redacted tool args. Tool-specific drops applied (see redaction.ts). */
+  /** Sanitized tool args. Sensitive fields dropped (see sanitize.ts). */
   args: Record<string, unknown>;
 }
 
@@ -103,6 +104,8 @@ export interface SessionEndObservation extends ObservationBase {
   tool_count: number;
   /** Whether any edit/write tool fired during this session. */
   files_modified: boolean;
+  /** Number of observations dropped due to write failures since last reset. */
+  observations_dropped: number;
 }
 
 /** Compaction boundary — emitted on `session.compacted` event. */
@@ -123,6 +126,40 @@ export type ObservationType = Observation["type"];
 // JSONL writer
 // ---------------------------------------------------------------------------
 
+/** Maximum file size before rotation (10 MB). */
+export const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024;
+
+/** Tracked byte count — avoids per-write statSync. */
+let bytesWritten = 0;
+
+/** Count of observations dropped due to write failures since last reset. */
+let droppedCount = 0;
+
+/**
+ * Seed the byte counter from an existing file's size. Called once at
+ * plugin init so that rotation tracking resumes across plugin restarts.
+ * If the file doesn't exist yet, `bytesWritten` stays at 0.
+ */
+export function initBytesWritten(filePath: string): void {
+  try {
+    const stats = fs.statSync(filePath);
+    bytesWritten = stats.size;
+  } catch {
+    bytesWritten = 0;
+  }
+}
+
+/**
+ * Get the number of dropped observations since the last reset, then reset
+ * the counter to zero. Called when building the `session_end` observation
+ * to surface write failures in the observation stream.
+ */
+export function getAndResetDroppedCount(): number {
+  const count = droppedCount;
+  droppedCount = 0;
+  return count;
+}
+
 /**
  * Append a single observation as one JSON line to `filePath`.
  *
@@ -130,16 +167,37 @@ export type ObservationType = Observation["type"];
  * `safeExecute`, but we add an inner try/catch here for a tighter boundary
  * around disk I/O — disk full, EACCES, ENOSPC, etc. should never propagate.
  *
+ * File rotation: when `bytesWritten` exceeds MAX_FILE_SIZE_BYTES, the
+ * current file is renamed to `<name>.1.jsonl` (one backup) before writing.
+ * The byte counter is maintained in-memory to avoid per-write statSync.
+ *
  * The function is intentionally void: callers cannot recover from a write
  * failure, and observation loss is preferable to disrupting the user's
- * session. Errors are silently swallowed; the outer `safeExecute` will log
- * them via `client.app.log` if they bubble up, but they shouldn't.
+ * session. Errors are counted via `droppedCount` and surfaced in
+ * `session_end` observations.
  */
-export function writeObservation(filePath: string, obs: Observation): void {
+export function writeObservation(filePath: string | null, obs: Observation): void {
+  if (filePath === null) return;
   try {
-    fs.appendFileSync(filePath, JSON.stringify(obs) + "\n", "utf-8");
+    // Rotate if the tracked size exceeds the threshold
+    if (bytesWritten >= MAX_FILE_SIZE_BYTES) {
+      try {
+        const { dir, name, ext } = path.parse(filePath);
+        const backupPath = path.join(dir, `${name}.1${ext}`);
+        fs.renameSync(filePath, backupPath);
+        bytesWritten = 0;
+      } catch {
+        // Rename failed — don't reset bytesWritten so we retry next time.
+        // The file continues growing until rename succeeds or disk is freed.
+      }
+    }
+
+    const line = JSON.stringify(obs) + "\n";
+    fs.appendFileSync(filePath, line, "utf-8");
+    bytesWritten += Buffer.byteLength(line, "utf-8");
   } catch {
-    // Disk write failed — best to drop this observation and keep the session
-    // healthy. The next observation will retry implicitly.
+    // Disk write failed — increment the dropped counter and keep the session
+    // healthy. The count is surfaced in the next session_end observation.
+    droppedCount++;
   }
 }
